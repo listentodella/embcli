@@ -4,14 +4,16 @@
 mod fmt;
 
 use core::convert::Infallible;
-
+use core::str::FromStr;
 use embassy_executor::Spawner;
-use embassy_stm32::gpio::{AnyPin, Level, Output, Speed};
+use embassy_stm32::gpio::{AnyPin, Input, Level, Output, OutputType, Pin, Pull, Speed};
 use embassy_stm32::usart::{Config as UartConfig, Uart};
+use embassy_stm32::usb_otg::Out;
 use embassy_stm32::{bind_interrupts, peripherals, usart};
 use embassy_time::{Duration, Timer};
 use embedded_io::ErrorType;
 use fmt::{info, todo, unwrap};
+use heapless::String;
 #[cfg(not(feature = "defmt"))]
 use panic_halt as _;
 #[cfg(feature = "defmt")]
@@ -19,7 +21,7 @@ use {defmt_rtt as _, panic_probe as _};
 
 use embedded_cli::cli::CliBuilder;
 use embedded_cli::cli::CliHandle;
-use embedded_cli::Command;
+use embedded_cli::{command, Command};
 use ufmt::{uwrite, uwriteln};
 
 bind_interrupts!(struct Irqs {
@@ -27,7 +29,7 @@ bind_interrupts!(struct Irqs {
 });
 
 #[derive(Debug, Command)]
-enum BaseCommand {
+enum BaseCommand<'a> {
     /// Control LEDs
     Led {
         /// LED id
@@ -36,9 +38,37 @@ enum BaseCommand {
         #[command(subcommand)]
         command: LedCommand,
     },
+    Pin {
+        #[arg(short = 'p', long)]
+        pin_name: &'a str,
+        #[command(subcommand)]
+        command: PinCommand<'a>,
+    },
 
     /// Show some status
     Status,
+}
+
+#[derive(Debug, Command)]
+enum PinCommand<'a> {
+    /// Get pin's num
+    Get,
+    /// Set LED value
+    Set {
+        /// used to config input or output
+        #[arg(short = 'd', long)]
+        dir: Option<&'a str>,
+        /// used to config low or high
+        #[arg(short = 'm', long)]
+        level: Option<&'a str>,
+        /// used to config speed
+        #[arg(long)]
+        speed: Option<&'a str>,
+        #[arg(long)]
+        pull: Option<&'a str>,
+        #[arg(long)]
+        outype: Option<&'a str>,
+    },
 }
 
 #[derive(Debug, Command)]
@@ -106,6 +136,142 @@ fn on_led(
     Ok(())
 }
 
+fn get_pin_num(pin_name: &str) -> Option<u8> {
+    if pin_name.len() > 4 || pin_name.len() < 2 {
+        return None;
+    }
+
+    let mut pin_name: String<8> = String::from_str(pin_name).unwrap();
+    pin_name.make_ascii_uppercase();
+
+    let mut pin_name = pin_name.chars();
+    let mut port_num = 0u8;
+    let mut pin_num = 0u8;
+    if let Some(port) = pin_name.next() {
+        if !('A'..='Z').contains(&port) {
+            return None;
+        }
+        port_num = port as u8 - b'A';
+    }
+    if let Ok(num) = pin_name.as_str().parse::<u8>() {
+        if num > 15 {
+            return None;
+        }
+        pin_num = num;
+    }
+
+    Some(port_num * 16 + pin_num)
+}
+
+fn on_pin(
+    cli: &mut CliHandle<'_, Writer, Infallible>,
+    state: &mut AppState,
+    pin_name: &str,
+    command: PinCommand,
+) -> Result<(), Infallible> {
+    state.num_commands += 1;
+    match command {
+        PinCommand::Get => {
+            if let Some(num) = get_pin_num(pin_name) {
+                uwrite!(cli.writer(), "get pin number = {}", num)?;
+            } else {
+                uwrite!(cli.writer(), "pin name should be like 'A9', 'B15'...")?;
+            }
+        }
+        PinCommand::Set {
+            dir,
+            level,
+            speed,
+            pull,
+            outype,
+        } => {
+            let mut pin = 0;
+            if let Some(num) = get_pin_num(pin_name) {
+                pin = num;
+                uwrite!(cli.writer(), "get pin number = {}", num)?;
+            } else {
+                uwrite!(cli.writer(), "pin name should be like 'A9', 'B15'...")?;
+                return Ok(());
+            }
+            let pin = unsafe { AnyPin::steal(pin) };
+
+            let mut is_output = false;
+            if let Some(dir) = dir {
+                let mut dir: String<8> = String::from_str(dir).unwrap();
+                dir.make_ascii_lowercase();
+                let dir = dir.as_str();
+                if dir == "input" {
+                    is_output = false;
+                } else if dir == "output" {
+                    is_output = true;
+                } else {
+                    uwrite!(cli.writer(), "dir should be 'input' or 'output'...")?;
+                    return Ok(());
+                }
+            }
+            let mut spd = Speed::VeryHigh;
+            if let Some(s) = speed {
+                let mut s: String<8> = String::from_str(s).unwrap();
+                s.make_ascii_lowercase();
+                let s = s.as_str();
+                if s == "veryhigh" {
+                    spd = Speed::VeryHigh;
+                } else if s == "high" {
+                    spd = Speed::High;
+                } else if s == "medium" {
+                    spd = Speed::Medium;
+                } else if s == "low" {
+                    spd = Speed::Low;
+                }
+            }
+
+            let mut pt = Pull::Up;
+            if let Some(p) = pull {
+                let mut p: String<8> = String::from_str(p).unwrap();
+                p.make_ascii_lowercase();
+                let p = p.as_str();
+                if p == "up" {
+                    pt = Pull::Up;
+                } else if p == "down" {
+                    pt = Pull::Down;
+                }
+            }
+
+            let mut _out_type = OutputType::PushPull;
+            if let Some(o) = outype {
+                let mut o: String<12> = String::from_str(o).unwrap();
+                o.make_ascii_lowercase();
+                let o = o.as_str();
+                if o == "opendrain" {
+                    _out_type = OutputType::OpenDrain;
+                } else if o == "pushpull" {
+                    _out_type = OutputType::PushPull;
+                }
+            }
+
+            let mut lvl = Level::High;
+            if let Some(l) = level {
+                let mut l: String<8> = String::from_str(l).unwrap();
+                l.make_ascii_lowercase();
+                let l = l.as_str();
+                if l == "low" {
+                    lvl = Level::Low;
+                } else if l == "high" {
+                    lvl = Level::High;
+                }
+            }
+
+            if is_output {
+                let _ = Output::new(pin, lvl, spd);
+            } else {
+                let _ = Input::new(pin, pt);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn on_status(
     cli: &mut CliHandle<'_, Writer, Infallible>,
     state: &mut AppState,
@@ -137,8 +303,8 @@ async fn cli_task(uart: peripherals::USART1, pin1: peripherals::PA10, pin2: peri
     // History buffer is 1 byte longer so max command fits in it (it requires extra byte at end)
     // SAFETY: buffers are passed to cli and are used by cli only
     let (command_buffer, history_buffer) = unsafe {
-        static mut COMMAND_BUFFER: [u8; 40] = [0; 40];
-        static mut HISTORY_BUFFER: [u8; 41] = [0; 41];
+        static mut COMMAND_BUFFER: [u8; 128] = [0; 128];
+        static mut HISTORY_BUFFER: [u8; 128] = [0; 128];
         (COMMAND_BUFFER.as_mut(), HISTORY_BUFFER.as_mut())
     };
     let mut cli = unwrap!(CliBuilder::default()
@@ -187,6 +353,9 @@ Use left and right to move inside input."
             &mut BaseCommand::processor(|cli, command| match command {
                 BaseCommand::Led { id, command } => on_led(cli, &mut state, id, command),
                 BaseCommand::Status => on_status(cli, &mut state),
+                BaseCommand::Pin { pin_name, command } => {
+                    on_pin(cli, &mut state, pin_name, command)
+                }
             }),
         );
     }
